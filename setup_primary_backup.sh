@@ -9,6 +9,10 @@ REMOTE_BACKUP_DIR="/var/db/postgres0/pg_backup"
 REMOTE_WAL_ARCHIVE_DIR="/var/db/postgres0/wal_archive"
 DAYS_TO_KEEP=7  # На основном узле храним 1 неделю
 REMOTE_DAYS_TO_KEEP=28  # На резервном узле храним 4 недели
+DB_NAME="dryblackfood"
+DB_PORT="9833"
+DB_USER="postgres0"
+DUMP_FILE="/var/db/postgres0/backup_dump.sql"
 
 # Создание резервной копии
 DATE=$(date +"%Y%m%d%H%M")
@@ -129,3 +133,52 @@ ln -s $NEW_TABSPACE_BWH48 $STANDBY_DB_DIR/pg_tblspc/16387
 echo "Смотрим появились ли данные"
 psql -p 9833 -U postgres0 -d dryblackfood
 SELECT * FROM data_bwh48;
+
+DUMP_FILE="/var/db/postgres0/backup_dump.sql"
+
+echo "Этап 4(логическое повреждение данных)"
+echo "Начинаем тестирование восстановления данных"
+
+echo "Создаем тестовую таблицу..."
+psql -p 9833 -U postgres0 -d postgres << EOF
+    CREATE TABLE IF NOT EXISTS test_table (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100),
+        description TEXT
+    );
+EOF
+
+echo "Добавляем тестовые данные в таблицу..."
+psql -p 9833 -U postgres0 -d postgres << EOF
+    INSERT INTO test_table (name, description) VALUES 
+    ('Тестовый Продукт 1', 'Тестовое Описание 1'),
+    ('Тестовый Продукт 2', 'Тестовое Описание 2'),
+    ('Тестовый Продукт 3', 'Тестовое Описание 3');
+EOF
+
+echo "Текущее состояние таблицы после добавления данных:"
+psql -p 9833 -U postgres0 -d postgres -c "SELECT * FROM test_table;"
+
+echo "Создаем резервную копию на резервном узле..."
+ssh $STANDBY_HOST "pg_dump -p 9833 -U postgres0 -d postgres > $DUMP_FILE"
+
+echo "Имитируем повреждение данных..."
+psql -p 9833 -U postgres0 -d postgres << EOF
+    UPDATE test_table SET id = id + 10000;
+    UPDATE test_table SET name = 'Поврежденные данные ' || id;
+EOF
+
+echo "Состояние таблицы после повреждения данных:"
+psql -p 9833 -U postgres0 -d postgres -c "SELECT * FROM test_table;"
+
+echo "Восстанавливаем данные из резервной копии..."
+scp $STANDBY_HOST:$DUMP_FILE $DUMP_FILE
+psql -p 9833 -U postgres0 -d postgres << EOF
+    DROP TABLE IF EXISTS test_table;
+    \i $DUMP_FILE
+EOF
+
+echo "Финальное состояние таблицы после восстановления:"
+psql -p 9833 -U postgres0 -d postgres -c "SELECT * FROM test_table;"
+
+echo "Тестирование восстановления данных завершено"
