@@ -1,70 +1,131 @@
 #!/bin/bash
 
 # Конфигурация
-PRIMARY_HOST="pg131"
-PRIMARY_USER="postgres0"
-STANDBY_HOST="pg137"
-STANDBY_USER="postgres0"
-BACKUP_DIR="/var/db/postgres0/backups"
+BACKUP_DIR="/var/db/postgres0/pg_backup"
 WAL_ARCHIVE_DIR="/var/db/postgres0/wal_archive"
-RETENTION_PRIMARY="7"  # дней
-RETENTION_STANDBY="28" # дней
+REMOTE_HOST="postgres0@pg137"
+STANDBY_HOST="postgres0@pg131"
+REMOTE_BACKUP_DIR="/var/db/postgres0/pg_backup"
+REMOTE_WAL_ARCHIVE_DIR="/var/db/postgres0/wal_archive"
+DAYS_TO_KEEP=7  # На основном узле храним 1 неделю
+REMOTE_DAYS_TO_KEEP=28  # На резервном узле храним 4 недели
 
-# Создание необходимых директорий
+# Создание резервной копии
+DATE=$(date +"%Y%m%d%H%M")
+BACKUP_NAME="backup_$DATE"
+
+export BACKUP_DIR WAL_ARCHIVE_DIR REMOTE_HOST STANDBY_HOST REMOTE_BACKUP_DIR \
+REMOTE_WAL_ARCHIVE_DIR  WAL_DIR DAYS_TO_KEEP REMOTE_DAYS_TO_KEEP DATE BACKUP_NAME
+
+# Создание необходимых директорий, если их нет
 mkdir -p $BACKUP_DIR
 mkdir -p $WAL_ARCHIVE_DIR
-chown -R postgres:postgres $BACKUP_DIR
-chown -R postgres:postgres $WAL_ARCHIVE_DIR
+
+chown -R postgres0:postgres $BACKUP_DIR
+chown -R postgres0:postgres $WAL_ARCHIVE_DIR
 
 # Настройка PostgreSQL для архивирования WAL
 cat << EOF | tee -a /var/db/postgres0/ygh351/postgresql.conf
-# Архивирование WAL
 wal_level = replica
 archive_mode = on
-archive_command = 'scp %p $STANDBY_USER@$STANDBY_HOST:$WAL_ARCHIVE_DIR/%f'
-max_wal_senders = 10
-wal_keep_segments = 32
+archive_command = 'scp %p $STANDBY_HOST:$WAL_ARCHIVE_DIR/%f'
+archive_timeout = 60
 EOF
 
-# Создание скрипта резервного копирования
-cat << 'EOF' | tee /var/db/postgres0/perform_backup.sh
-#!/bin/bash
+# Попытка перезапуска PostgreSQL: если сервер не запущен — просто стартуем
+if pg_ctl -D /var/db/postgres0/ygh351 status > /dev/null 2>&1; then
+    echo "PostgreSQL уже запущен, перезапускаем..."
+    pg_ctl -D /var/db/postgres0/ygh351 restart
+else
+    echo "PostgreSQL не запущен, запускаем..."
+    pg_ctl -D /var/db/postgres0/ygh351 start
+fi
 
-BACKUP_DIR="/var/db/postgres0/backups"
-WAL_ARCHIVE_DIR="/var/db/postgres0/wal_archive"
-STANDBY_HOST="pg137"
-STANDBY_USER="postgres0"
-RETENTION_PRIMARY="7"
-RETENTION_STANDBY="28"
+echo "Выполнение полного резервного копирования с помощью pg_basebackup"
+pg_basebackup -D $BACKUP_DIR/$BACKUP_NAME -Ft -P -U postgres0 -p 9833
+ 
+echo "Отправка резервной копии на резервный хост через SCP"
+scp $BACKUP_DIR/$BACKUP_NAME/* $REMOTE_HOST:$REMOTE_BACKUP_DIR/
 
-# Создание резервной копии
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_NAME="base_backup_$TIMESTAMP"
-BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
+echo "Отправка WAL архива на резервный хост через SCP"
+scp $WAL_ARCHIVE_DIR/* $STANDBY_HOST:$REMOTE_WAL_ARCHIVE_DIR/
 
-# Выполнение полного резервного копирования
-pg_basebackup -D $BACKUP_PATH -Fp -Xs -P # TODO: не может подключиться к БД
+echo "Начинаем процесс восстановления на резервной узле (ЭТАП 2)"
+ssh $REMOTE_HOST
 
-# Сжатие резервной копии
-tar -czf $BACKUP_PATH.tar.gz $BACKUP_PATH
-rm -rf $BACKUP_PATH
+export BACKUP_DIR="/var/db/postgres0/pg_backup"
+export WAL_ARCHIVE_DIR="/var/db/postgres0/wal_archive"
+export STANDBY_DB_DIR="/var/db/postgres0/ygh351"  
+export TABSPACE_BWH48="/var/db/postgres0/bwh48"
+export TABSPACE_TDJ86="/var/db/postgres0/tdj86" 
+export TABSPACE_IDX47="/var/db/postgres0/idx47" 
+export NEW_TABSPACE_BWH48="/var/db/postgres0/newForBhw"
 
-# Копирование на резервный узел
-scp $BACKUP_PATH.tar.gz $STANDBY_USER@$STANDBY_HOST:$BACKUP_DIR/
+mkdir -p $BACKUP_DIR
+mkdir -p $WAL_ARCHIVE_DIR
 
-# Очистка старых резервных копий на основном узле
-find $BACKUP_DIR -name "base_backup_*.tar.gz" -mtime +$RETENTION_PRIMARY -delete
-find $WAL_ARCHIVE_DIR -name "*.history" -mtime +$RETENTION_PRIMARY -delete
-find $WAL_ARCHIVE_DIR -name "*.backup" -mtime +$RETENTION_PRIMARY -delete
+chown -R postgres0:postgres $BACKUP_DIR
+chown -R postgres0:postgres $WAL_ARCHIVE_DIR
+
+if pg_ctl -D $STANDBY_DB_DIR status > /dev/null 2>&1; then
+    echo "PostgreSQL работает, останавливаем..."
+    pg_ctl -D $STANDBY_DB_DIR stop
+else
+    echo "PostgreSQL не запущен, продолжаем..."
+fi
+
+echo "Очищаем директорию данных..."
+rm -rf $STANDBY_DB_DIR/*
+
+echo "Восстанавливаем данные из бэкапа..."
+tar -xf $BACKUP_DIR/base.tar -C $STANDBY_DB_DIR
+
+echo "Восстанавливаем WAL архивы..."
+tar -xf $BACKUP_DIR/pg_wal.tar -C $STANDBY_DB_DIR/pg_wal
+
+echo "Начинаем доставать табличные пространства"
+mkdir -p $TABSPACE_BWH48
+mkdir -p $TABSPACE_TDJ86
+mkdir -p $TABSPACE_IDX47
+
+
+tar -xvf $BACKUP_DIR/16387.tar -C $TABSPACE_BWH48
+tar -xvf $BACKUP_DIR/16388.tar -C $TABSPACE_IDX47
+tar -xvf $BACKUP_DIR/16389.tar -C $TABSPACE_TDJ86
+
+echo "Удаление старых символьных ссылок и создание новых"
+rm -f $STANDBY_DB_DIR/pg_tblspc/16387
+rm -f $STANDBY_DB_DIR/pg_tblspc/16388
+rm -f $STANDBY_DB_DIR/pg_tblspc/16389
+
+ln -s $TABSPACE_BWH48 $STANDBY_DB_DIR/pg_tblspc/16387
+ln -s $TABSPACE_IDX47 $STANDBY_DB_DIR/pg_tblspc/16388
+ln -s $TABSPACE_TDJ86 $STANDBY_DB_DIR/pg_tblspc/16389
+
+
+echo "Запуск PostgreSQL на резервной ноде..."
+cat << EOF | tee -a $STANDBY_DB_DIR/postgresql.conf
+restore_command = 'scp /var/db/postgres0/wal_archive/%f %p'
 EOF
+touch $STANDBY_DB_DIR/recovery.signal
+pg_ctl -D $STANDBY_DB_DIR start
 
-# Установка прав на выполнение скрипта резервного копирования
-chmod +x /var/db/postgres0/perform_backup.sh
+echo "Подключаемся к базе данных и выводим данные..."
+psql -p 9833 -U postgres0 -d dryblackfood 
+\dt
 
-# Добавление задания в cron для еженедельного резервного копирования
-(crontab -l 2>/dev/null; echo "0 0 * * 0 /var/db/postgres0/perform_backup.sh") | crontab -
-
-# Перезапуск PostgreSQL для применения изменений
-pg_ctl -D /var/db/postgres0/ygh35 restart
-
-echo "Настройка резервного копирования на основном узле завершена!" 
+echo "Этап 3(эмитация сбоя базы данных,связанного с потерей какого-то из табличных пространств)"
+rm -rf /var/db/postgres0/bwh48
+echo "Смотрим что нету доступа"
+psql -p 9833 -U postgres0 -d dryblackfood
+SELECT * FROM data_bwh48;
+mkdir -p newForBhw
+rm -f $STANDBY_DB_DIR/pg_tblspc/16387
+echo "Распакуем в новую папку"
+tar -xvf $BACKUP_DIR/16387.tar -C $NEW_TABSPACE_BWH48
+echo "Перепривяжем в новую папку"
+rm -f $STANDBY_DB_DIR/pg_tblspc/16387
+ln -s $NEW_TABSPACE_BWH48 $STANDBY_DB_DIR/pg_tblspc/16387
+echo "Смотрим появились ли данные"
+psql -p 9833 -U postgres0 -d dryblackfood
+SELECT * FROM data_bwh48;
