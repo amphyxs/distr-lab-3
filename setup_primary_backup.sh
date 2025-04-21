@@ -47,7 +47,42 @@ fi
 
 echo "Выполнение полного резервного копирования с помощью pg_basebackup"
 pg_basebackup -D $BACKUP_DIR/$BACKUP_NAME -Ft -P -U postgres0 -p 9833
- 
+
+echo "Создание скрипта для бэкапов и cron-джобы по его запуску"
+cat << 'EOF' | tee /var/db/postgres0/perform_backup.sh
+#!/bin/bash
+
+BACKUP_DIR="/var/db/postgres0/backups"
+WAL_ARCHIVE_DIR="/var/db/postgres0/wal_archive"
+STANDBY_HOST="pg137"
+STANDBY_USER="postgres0"
+RETENTION_PRIMARY="7"
+RETENTION_STANDBY="28"
+
+# Создание резервной копии
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_NAME="base_backup_$TIMESTAMP"
+BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
+
+# Выполнение полного резервного копирования
+pg_basebackup -D $BACKUP_DIR/$BACKUP_NAME -Ft -P -U postgres0 -p 9833
+
+# Сжатие резервной копии
+tar -czf $BACKUP_PATH.tar.gz $BACKUP_PATH
+rm -rf $BACKUP_PATH
+
+# Копирование на резервный узел
+scp $BACKUP_PATH.tar.gz $STANDBY_USER@$STANDBY_HOST:$BACKUP_DIR/
+
+# Очистка старых резервных копий на основном узле
+find $BACKUP_DIR -name "base_backup_*.tar.gz" -mtime +$RETENTION_PRIMARY -delete
+find $WAL_ARCHIVE_DIR -name "*.history" -mtime +$RETENTION_PRIMARY -delete
+find $WAL_ARCHIVE_DIR -name "*.backup" -mtime +$RETENTION_PRIMARY -delete
+EOF
+
+chmod +x /var/db/postgres0/perform_backup.sh
+(crontab -l 2>/dev/null; echo "0 0 * * 0 /var/db/postgres0/perform_backup.sh") | crontab -
+
 echo "Отправка резервной копии на резервный хост через SCP"
 scp $BACKUP_DIR/$BACKUP_NAME/* $REMOTE_HOST:$REMOTE_BACKUP_DIR/
 
